@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import egress
 from settings import get_settings
 from ytdlp_wrapper._sanitize import YtDlpError, is_valid_url
 
@@ -138,7 +139,11 @@ async def run_ytdlp_ex(
 
     # Build final args: network (proxy/IP family) + credentials + flags + '--' + urls
     # The '--' separator prevents URLs from being interpreted as flags
-    all_args = ytdlp_network_args(s) + list(cred_args) + flags
+    try:
+        network_args = ytdlp_network_args(s)
+    except egress.ProxyConfigError as e:
+        raise YtDlpError(f"YouTube egress proxy configuration is invalid: {e}", cookie_ids=cookie_ids) from e
+    all_args = network_args + list(cred_args) + flags
     if urls:
         all_args.append("--")
         all_args.extend(urls)
@@ -172,9 +177,18 @@ async def run_ytdlp_ex(
         cookie_health.inspect_ytdlp_stderr(stderr_text, cookie_ids)
 
     if proc.returncode != 0:
+        # Never let the egress proxy URL / credentials reach logs or API errors.
+        raw_proxy = s.yt_egress_proxy if s.yt_egress_proxy_enabled else None
+        stderr_text = egress.redact_secrets(stderr_text, raw_proxy)
         error_msg = stderr_text or "Unknown error"
         logger.error(f"yt-dlp failed (exit code {proc.returncode}) for URL: {url}")
         logger.error(f"yt-dlp stderr: {error_msg}")
+        if raw_proxy:
+            logger.error(
+                "[Egress] stage=yt-dlp cause=%s proxy=%s",
+                egress.classify_egress_failure(error_msg, proxy_configured=True),
+                egress.redact_proxy_url(raw_proxy),
+            )
         raise YtDlpError(f"yt-dlp failed: {error_msg}", stderr=stderr_text, cookie_ids=cookie_ids)
 
     logger.debug(f"yt-dlp succeeded for URL: {url}")
