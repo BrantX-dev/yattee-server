@@ -164,13 +164,53 @@ async def run_ytdlp_ex(
             credentials.cleanup_temp_files(temp_files)
         raise YtDlpError(f"yt-dlp timed out after {timeout} seconds", cookie_ids=cookie_ids)
 
-    # Clean up temp files
+    stderr_text = stderr.decode(errors="replace").strip() if stderr else ""
+
+    # Keep the normal extractor path first because many videos already work.
+    # If YouTube selectively returns its anonymous-player bot check, retry only
+    # that failure through the mweb player. With POT enabled, bgutil supplies
+    # the matching GVS token through the configured provider.
+    bot_check = "sign in to confirm you" in stderr_text.lower() and "not a bot" in stderr_text.lower()
+    youtube_url = bool(url and ("youtube.com/" in url or "youtu.be/" in url))
+    has_player_client = any(
+        isinstance(arg, str) and arg.startswith("youtube:") and "player_client=" in arg.replace("-", "_")
+        for arg in flags
+    )
+    if proc.returncode != 0 and bot_check and youtube_url and s.yt_pot_enabled and not has_player_client:
+        logger.info("[Egress] stage=yt-dlp fallback=mweb+pot reason=youtube-bot-check")
+        retry_args = network_args + list(cred_args) + flags + [
+            "--extractor-args",
+            "youtube:player_client=mweb",
+        ]
+        if urls:
+            retry_args.append("--")
+            retry_args.extend(urls)
+        retry_proc = await asyncio.create_subprocess_exec(
+            s.ytdlp_path, *retry_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(retry_proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            retry_proc.kill()
+            await retry_proc.wait()
+            if temp_files:
+                import credentials
+
+                credentials.cleanup_temp_files(temp_files)
+            raise YtDlpError(f"yt-dlp mweb fallback timed out after {timeout} seconds", cookie_ids=cookie_ids)
+        proc = retry_proc
+        stderr_text = stderr.decode(errors="replace").strip() if stderr else ""
+        if proc.returncode == 0:
+            logger.info("[Egress] stage=yt-dlp fallback=mweb+pot result=success")
+        else:
+            logger.warning("[Egress] stage=yt-dlp fallback=mweb+pot result=failed")
+
+    # Clean up credential files only after the optional retry because that
+    # retry may need to reuse the same cookie file.
     if temp_files:
         import credentials
 
         credentials.cleanup_temp_files(temp_files)
-
-    stderr_text = stderr.decode(errors="replace").strip() if stderr else ""
     if cookie_ids:
         import cookie_health
 
